@@ -2,7 +2,6 @@ import dataclasses
 import logging
 import sys
 from asyncio import StreamWriter
-from datetime import datetime as dt
 from enum import Enum
 from typing import Literal, TypedDict
 
