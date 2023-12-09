@@ -1,7 +1,7 @@
 import asyncio
 from aioconsole import ainput
 
-from config import chat
+from config import chat, logger
 
 
 class Client:
@@ -30,14 +30,14 @@ class Client:
         while True:
             try:
                 message = await self.reader.read(1024)
-                if message.decode() == '/end' or message.decode() == '':
+                if message.decode() in ['/end', '']:
                     self.is_server_work = False
                     break
                 else:
-                    print(message.decode())
+                    logger.info(message.decode())
 
             except Exception as e:
-                print('read message error ', e)
+                logger.error('read message error ', e)
 
     async def send(self) -> None:
         """
@@ -53,7 +53,7 @@ class Client:
                 if message == '/exit' or not self.is_server_work:
                     break
             except Exception as e:
-                print('send_message_error', e)
+                logger.error('send_message_error', e)
 
 
 if __name__ == '__main__':
@@ -61,4 +61,4 @@ if __name__ == '__main__':
     try:
         asyncio.run(client.connect_chat())
     except (KeyboardInterrupt, ConnectionRefusedError, RuntimeError):
-        print('STOP')
+        logger.error('STOP')

@@ -1,4 +1,6 @@
 import asyncio
+import json
+import os
 import time
 from asyncio import StreamReader
 
@@ -6,9 +8,11 @@ import aiofiles
 
 from config import *
 
+user_stats = dict(dict())
+
 
 class Server:
-    def __init__(self, host=chat.host, port=chat.port):
+    def __init__(self, host: str = chat.host, port: int = chat.port):
         self.host = host
         self.port = port
 
@@ -21,8 +25,11 @@ class Server:
         server = await asyncio.start_server(
             self.client_connected, chat.host, chat.port
         )
-        async with server:
-            await server.serve_forever()
+        try:
+            async with server:
+                await server.serve_forever()
+        except asyncio.CancelledError:
+            logger.info('Server shutting down...')
 
     async def client_connected(
             self, reader: StreamReader, writer: StreamWriter
@@ -37,12 +44,18 @@ class Server:
 
         address: tuple[str, int] | None = writer.get_extra_info('peername')
         username, is_new_user = await self.authorization(writer, reader)
-        if username:
-            logger.info('Start serving %s', username)
-            await self.restore_messages(writer, is_new_user)
-            await self.live_chat(writer, reader)
-        else:
-            logger.info('Client <%s> error while authorization', address)
+        try:
+            if username:
+                logger.info('Start serving %s', username)
+                await self.restore_messages(writer, is_new_user)
+                await self.live_chat(writer, reader)
+            else:
+                logger.info('Client <%s> error while authorization', address)
+        except ConnectionResetError:
+            # self.delete_from_members(writer)
+            logger.info(
+                f'Client {username} error while run: ConnectionResetError'
+            )
 
     async def authorization(self, writer: StreamWriter, reader: StreamReader
                             ) -> tuple[str, bool]:
@@ -61,18 +74,19 @@ class Server:
             )
             is_new_user = username not in user_stats
             if is_new_user:
-                user_stats[username] = UserStats(
-                    counter_message=0,
-                    ban=False,
-                    complains=set(),
-                    start_timeout=None,
-                    finish_timeout=None,
-                    password=password,
-                    writers=[writer]
-                )
+                user_stats[username] = {
+                    'counter_message': 0,
+                    'ban': False,
+                    'complains': set(),
+                    'start_timeout': None,
+                    'finish_timeout': None,
+                    'password': password,
+                    'writers': [writer]
+                }
 
             fact_password = user_stats.get(username)['password']
             if fact_password == password:
+                await self.remove_old_messages()
                 welcome_message = f'\nWelcome to chat, {username}!\n'
                 await Server.write_to_chat(writer, welcome_message)
 
@@ -155,16 +169,20 @@ class Server:
         logger.debug('NEW USER restore messages')
         count = 0
         current_time = time.time()
-        for message in messages:
+        output = []
+        for message in reversed(messages):
             msg = message.split(sep=',')
             if current_time - float(msg[0]) > chat.lifetime_message:
                 continue
             if count > chat.backup_last_message:
                 break
-            if msg[2] is not None:   # should be non-private message
+            recipient = msg[2]
+            if recipient == 'None':   # should be non-private message
                 count += 1
-                writer.write(f'{msg[1]}: {msg[3]}'.encode())
-                await writer.drain()
+                output.append(f'{msg[1]}: {msg[3]}')
+        for message in reversed(output):
+            writer.write(message.encode())
+            await writer.drain()
 
     @staticmethod
     async def restore_for_reconnected_user(
@@ -191,22 +209,24 @@ class Server:
         index_first_message = 0
         for i, message in reversed(list(enumerate(messages))):
             msg = message.split(',')
-            if '/exit' == msg[3] and username == msg[1]:
+            if msg[3].startswith('/exit') and username == msg[1]:
                 index_first_message = i
 
         for message in messages[index_first_message:]:
             msg = message.split(',')
-            sender = msg[1], recipient = msg[2], text = msg[3]
+            sender = msg[1]
+            recipient = msg[2]
+            text = msg[3]
 
             text_to_restore = ''
-            if username == sender and recipient is None:
+            if username == sender and recipient == 'None':
                 text_to_restore = f'you:\t{text}'
-            elif username != sender and recipient is None:
+            elif username != sender and recipient == 'None':
                 text_to_restore = f'{sender}:\t{text}'
             elif username == recipient:
-                text_to_restore = f'<< {sender}:\t{text}'
-            elif username == sender and recipient is not None:
-                text_to_restore = f'>> {recipient}:\t{text}'
+                text_to_restore = f'>> {sender}:\t{text}'
+            elif username == sender and recipient != 'None':
+                text_to_restore = f'you >> {recipient}:\t{text}'
             else:
                 pass
             await Server.write_to_chat(writer, text_to_restore)
@@ -250,10 +270,12 @@ class Server:
 
             if message == '/status':
                 await self.show_status(writer)
+                continue
 
             if message == '/rules':
                 writer.write(chat.rules.encode())
                 await writer.drain()
+                continue
 
             try:
                 if not await Server.wait_for_unblocking(username):
@@ -263,7 +285,9 @@ class Server:
                     elif message.startswith('/private'):
                         await Server.send_private(writer, message)
                     else:
-                        await self.send_general(username, message)
+                        await self.send_general(writer, username, message)
+                    user_stats[username]['counter_message'] += 1
+
             except ConnectionResetError:
                 logger.error(
                     f'User {username} lost the connection while waiting'
@@ -301,7 +325,7 @@ class Server:
                         f'Total complaints: {new_count_bans}.')
                 await Server.write_to_chat(banned_writers, text)
             else:
-                text = f"You've been complained about for the third time."
+                text = f"You've been complained about for 3 time."
                 user_stats[banned]['ban'] = True
                 user_stats[banned]['start_timeout'] = time.time()
                 await Server.write_to_chat(banned_writers, text)
@@ -320,30 +344,32 @@ class Server:
         origin_timeout = user_stats[username]['start_timeout']
         if user_stats[username]['ban']:
             if origin_timeout + chat.ban_time > time.time():
-                timeout = origin_timeout + chat.ban_time - time.time()
+                finish_timeout = origin_timeout + chat.ban_time
+                timeout = finish_timeout - time.time()
+                user_stats[username]['finish_timeout'] = finish_timeout
                 t = time.strftime('%H:%M:%S', time.gmtime(timeout))
                 result_msg = f'You are banned. Wait another {t}'
                 await Server.write_to_chat(writers_list, result_msg)
                 await asyncio.sleep(timeout)
-                result_msg = 'You can write messages again'
-                await Server.write_to_chat(writers_list, result_msg)
             user_stats[username]['ban'] = False
             user_stats[username]['start_timeout'] = None
+            user_stats[username]['finish_timeout'] = None
             user_stats[username]['complains'] = set()
         else:
             if user_stats[username]['counter_message'] == chat.limit_message:
                 async with aiofiles.open(chat.backup_file, 'r') as file:
                     messages = await file.readlines()
-                    counter = 0
-                    for i in reversed(messages):
-                        msg = i.split(',')
-                        if msg[1] == username:
-                            if counter == chat.limit_message:
-                                time_0 = msg[0]
-                                break
-                            counter += 1
-                if time_0 + chat.lifetime_message > time.time():
-                    timeout = time_0 + chat.lifetime_message - time.time()
+                counter = 0
+                time_0: float = 0
+                for i in reversed(messages):
+                    msg = i.split(',')
+                    if msg[1] == username and not msg[3].startswith('/exit'):
+                        if counter == chat.limit_message:
+                            time_0 = float(msg[0])
+                            break
+                        counter += 1
+                if time_0 + chat.limit_message > time.time():
+                    timeout = time_0 + chat.limit_message - time.time()
                     t = time.strftime('%H:%M:%S', time.gmtime(timeout))
                     result_msg = (
                         f'You have reached the message limit. '
@@ -376,9 +402,10 @@ class Server:
             writer.write(b'/end')
             await Server.send_bye_message(username)
         except Exception as e:
-            logger.info(f'Client {username} out already: {e}')
-        await Server.store_message(username, '/exit')
-        Server.delete_from_members(username)
+            logger.info(f'Client {username} out already')
+        finally:
+            await Server.store_message(username, '/exit')
+            Server.delete_from_members(writer)
 
     @staticmethod
     async def send_bye_message(username: str) -> None:
@@ -392,31 +419,43 @@ class Server:
                 await Server.write_to_chat(some_writer, bye_message)
 
     @staticmethod
-    def delete_from_members(username: str) -> None:
+    def delete_from_members(writer: StreamWriter) -> None:
         """
         Функция удаляет всю информацию о пользователе,
         связанную с его объектами StreamWriter
         """
-
-        writers = user_stats[username]['writers']
-        for stream in writers:
-            if stream in actual_streams:
-                actual_streams.remove(stream)
-            if stream in user_from_stream:
-                del user_from_stream[stream]
-        user_stats[username]['writers'] = []
+        username = user_from_stream[writer]
+        actual_streams.remove(writer)
+        del user_from_stream[writer]
+        user_stats[username]['writers'].remove(writer)
+        if len(actual_streams) == 0:
+            with open("user-stats.json", "w") as file:
+                json.dump(user_stats, file)
 
     async def show_status(self, writer: StreamWriter) -> None:
         """
         Вывод состояния чата.
         """
+        user = user_from_stream[writer]
         status = (
             f'======= CHAT INFO: ========\n'
             f'*\tHOST\t= {self.host}\n'
             f'*\tPORT\t= {self.port}\n'
             f'*\tUSERS ONLINE:\t {len(user_stats)}\n'
             f'*\tCONNECTIONS:\t{len(actual_streams)}\n'
+            f'======= ABOUT YOU: ========\n'
+            f'*\tHOW MANY CLIENTS\t= {len(user_stats[user]['writers'])}\n'
+            f'*\tCOUNTER MESSAGE\t= {user_stats[user]['counter_message']}\n'
+            f'*\tAMOUNT OF COMPLAINTS\t= {len(user_stats[user]['complains'])}\n'
         )
+        if user_stats[user]['ban'] or user_stats[user]['finish_timeout']:
+            t = time.strftime(
+                '%H:%M:%S',
+                time.gmtime(user_stats[user]["finish_timeout"] - time.time())
+            )
+            status += (
+                f'*\tBANNED FOR\t{t}\n'
+            )
         await Server.write_to_chat(writer, status)
 
     @staticmethod
@@ -436,19 +475,22 @@ class Server:
             message = ' '.join(message.split(' ')[2:])
 
             if recipient_name not in user_stats:
-                text = f'{recipient_name} : No such user\n'
+                text = f'No such user - "{recipient_name}"\n'
+                await Server.write_to_chat(sender_writers, text)
+                return
+            if recipient_name == sender_name:
+                text = 'No point in sending it to yourself\n'
                 await Server.write_to_chat(sender_writers, text)
                 return
             logger.debug(f'Сообщение от {sender_name} к {recipient_name}:')
             logger.debug(message)
 
-            for some_writer in actual_streams:
-                if user_from_stream[some_writer] == sender_name:
-                    text = f'>> {recipient_name}:\t{message}'
-                    await Server.write_to_chat(some_writer, text)
-                elif user_from_stream[some_writer] == recipient_name:
-                    text = f'<< {sender_name}:\t{message}'
-                    await Server.write_to_chat(some_writer, text)
+            for some_writer in user_stats[recipient_name]['writers']:
+                text = f'>> {sender_name}:\t{message}'
+                await Server.write_to_chat(some_writer, text)
+                await Server.store_message(
+                    sender_name, message, recipient_name
+                )
 
         except IndexError:
             error_message = (
@@ -457,7 +499,7 @@ class Server:
             )
             await Server.write_to_chat(sender_writers, error_message)
 
-    async def send_general(self, sender: str, text: str) -> None:
+    async def send_general(self, writer: StreamWriter, sender: str, text: str) -> None:
         """
         Отправка сообщений в общий чат.
         Для отправителя сообщение выводится с приставкой "you".
@@ -467,9 +509,12 @@ class Server:
             for some_writer in actual_streams:
                 if user_from_stream[some_writer] != sender:
                     message = f'{sender}:\t{text}'
+                    await Server.write_to_chat(some_writer, message)
                 else:
-                    message = f'you:\t{text}'
-                await Server.write_to_chat(some_writer, message)
+                    if some_writer != writer:
+                        message = f'you:\t{text}'
+                        await Server.write_to_chat(some_writer, message)
+
 
     @staticmethod
     async def store_message(
@@ -483,22 +528,23 @@ class Server:
             message = f'{message_time},{sender},{recipient},{text}\n'
             await file.write(message)
 
+    async def show_messages_upon_login(self, username, is_new_user) -> None:
+        pass
+
     @staticmethod
     async def remove_old_messages():
-        while True:
-            async with aiofiles.open(chat.backup_file, 'r') as file:
-                text = await file.readlines()
-                records = [text[0]]
-                if len(text) > 1:
-                    current_time = time.time()
-                    for i in text[1:]:
-                        if (current_time - float(i.split(',')[0]) <
-                                chat.lifetime_message):
-                            records.append(i)
-            async with aiofiles.open(chat.backup_file, 'w') as file:
-                await file.writelines(text)
-            # Повторяем чистку файла каждую минуту
-            await asyncio.sleep(60)
+        async with aiofiles.open(chat.backup_file, 'r') as file:
+            print('Removing old messages')
+            text = await file.readlines()
+            records = [text[0]]
+        if len(text) > 1:
+            current_time = time.time()
+            for i in text[1:]:
+                if (current_time - float(i.split(',')[0]) <
+                        chat.lifetime_message):
+                    records.append(i)
+        async with aiofiles.open(chat.backup_file, 'w') as file:
+            await file.writelines(records)
 
     @staticmethod
     async def write_to_chat(
@@ -516,10 +562,15 @@ class Server:
 
 if __name__ == '__main__':
     chat_server = Server()
-    with open(chat.backup_file, 'w') as f:
-        f.write('Timestamp,Sender,Recipient,Text\n')
-        logger.info('Backup file is created')
-    cleanup_messages = asyncio.create_task(chat_server.remove_old_messages())
+    if (not os.path.exists(chat.backup_file)
+            or os.path.getsize(chat.backup_file) == 0):
+        with open(chat.backup_file, 'w') as f:
+            f.write('Timestamp,Sender,Recipient,Text\n')
+            logger.info('Backup file is created')
+    if (os.path.exists("user-stat.json")
+            and os.path.getsize("user-stat.json") != 0):
+        with open("user-stat.json", "r") as f:
+            user_stats = json.load(f)
     try:
         asyncio.run(chat_server.trigger())
     except (KeyboardInterrupt, RuntimeError):
